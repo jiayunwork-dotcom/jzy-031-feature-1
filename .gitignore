@@ -1,0 +1,12 @@
+# Go
+backend/bin/
+*.out
+/tmp/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# local data
+pgdata/
+redis-data/

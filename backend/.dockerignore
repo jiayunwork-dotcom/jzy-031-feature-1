@@ -1,0 +1,4 @@
+*.md
+.git
+internal/testboot
+**/*_test.go

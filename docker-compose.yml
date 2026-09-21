@@ -1,0 +1,65 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: rl-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: rl-postgres
+    environment:
+      POSTGRES_USER: rl
+      POSTGRES_PASSWORD: rl
+      POSTGRES_DB: ratelimit
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rl -d ratelimit"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  backend:
+    build:
+      context: ./backend
+    container_name: rl-backend
+    environment:
+      HTTP_ADDR: ":8080"
+      REDIS_ADDR: "redis:6379"
+      POSTGRES_DSN: "postgres://rl:rl@postgres:5432/ratelimit?sslmode=disable"
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # Scale horizontally with:
+    #   docker compose up -d --scale backend=3
+    # All replicas share one Redis, so quotas stay consistent.
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: rl-frontend
+    ports:
+      - "8081:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  pg-data:
