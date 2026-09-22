@@ -14,9 +14,9 @@ import (
 
 func newRouter(t *testing.T) http.Handler {
 	t.Helper()
-	rdb, rules, mgr, rec := testboot.FullStack(t)
-	checker := quota.New(rules, mgr, rdb, rec)
-	return api.NewServer(testCfg(), rules, mgr, rec, checker, rdb).Router()
+	rdb, rules, rollouts, mgr, rec := testboot.FullStack(t)
+	checker := quota.New(rules, rollouts, mgr, rdb, rec)
+	return api.NewServer(testCfg(), rules, rollouts, mgr, rec, checker, rdb).Router()
 }
 
 func postJSON(t *testing.T, h http.Handler, path string, body any) (int, map[string]any) {

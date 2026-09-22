@@ -61,10 +61,25 @@ func contains(xs []string, v string) bool {
 //
 // Format: rl:{ruleID}:{level}:<ordered dim=value pairs>
 func (m *Matcher) Key(rule *model.Rule, level model.Level, rctx model.RequestContext) string {
+	return m.VersionedKey(rule, level, rctx, "")
+}
+
+// VersionedKey builds the bucket key for one rule version during a gray
+// rollout. The stable version ("") keeps the historical key layout so its
+// counters continue seamlessly when a rollout starts; the canary version gets
+// an extra "canary" segment so the two versions' quotas are fully isolated and
+// can never borrow each other's slots.
+//
+// canary format: rl:{ruleID}:canary:{level}:<dim pairs>
+func (m *Matcher) VersionedKey(rule *model.Rule, level model.Level, rctx model.RequestContext, version string) string {
 	var b strings.Builder
 	b.WriteString("rl:{")
 	b.WriteString(rule.ID)
 	b.WriteString("}:")
+	if version != "" {
+		b.WriteString(version)
+		b.WriteString(":")
+	}
 	b.WriteString(string(level))
 	b.WriteString(":")
 

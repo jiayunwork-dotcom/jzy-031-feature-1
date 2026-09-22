@@ -1,13 +1,25 @@
 <script setup lang="ts">
 import { reactive, ref, watch, computed } from 'vue'
-import type { Algorithm, Dimension, Level, Rule, RuleDraft, RuleLevel } from '../lib/types'
+import type { Algorithm, Dimension, Level, Rollout, Rule, RuleDraft, RuleLevel } from '../lib/types'
 import { api } from '../lib/api'
 
-const props = defineProps<{ selected: Rule | null }>()
+const props = defineProps<{
+  selected: Rule | null
+  // When set, the editor edits the NEW (canary) content of this in-flight
+  // rollout instead of the live rule.
+  canaryOf?: Rollout | null
+  // The selected rule's current rollout (null when none is in flight).
+  existingRollout?: Rollout | null
+}>()
 const emit = defineEmits<{
   (e: 'saved', rule: Rule): void
   (e: 'canceled'): void
   (e: 'deleted', id: string): void
+  // Start a gray change: submit the edited content as the canary at percent.
+  (e: 'start-canary', payload: { id: string; draft: RuleDraft; percent: number }): void
+  // Fired when the operator saves edited canary content for a rollout.
+  (e: 'canary-saved', payload: { id: string; draft: RuleDraft }): void
+  (e: 'canary-canceled'): void
 }>()
 
 const ALGORITHMS: { value: Algorithm; label: string; hint: string }[] = [
@@ -52,25 +64,36 @@ const form = reactive<RuleDraft>(blank())
 const matcherText = reactive<Record<string, string>>({})
 const error = ref<string>('')
 const saving = ref(false)
+// Initial percent (0..100) for a new gray change.
+const canaryPercentInput = ref('10')
 
 const editingId = computed(() => props.selected?.id ?? null)
+const isCanaryMode = computed(() => !!props.canaryOf)
 const needsWindow = computed(() => !isBucket(form.algorithm))
 const needsBurst = computed(() => isBucket(form.algorithm))
 
+function fillFromRule(r: Rule) {
+  form.name = r.name
+  form.enabled = r.enabled
+  form.algorithm = r.algorithm
+  form.dimensions = [...r.dimensions]
+  form.levels = JSON.parse(JSON.stringify(r.levels))
+  form.matchers = r.matchers ? JSON.parse(JSON.stringify(r.matchers)) : {}
+  for (const d of DIMENSIONS) {
+    matcherText[d.value] = (r.matchers?.[d.value] ?? []).join(', ')
+  }
+}
+
 watch(
-  () => props.selected,
-  (r) => {
+  () => [props.selected, props.canaryOf],
+  () => {
     error.value = ''
-    if (r) {
-      form.name = r.name
-      form.enabled = r.enabled
-      form.algorithm = r.algorithm
-      form.dimensions = [...r.dimensions]
-      form.levels = JSON.parse(JSON.stringify(r.levels))
-      form.matchers = r.matchers ? JSON.parse(JSON.stringify(r.matchers)) : {}
-      for (const d of DIMENSIONS) {
-        matcherText[d.value] = (r.matchers?.[d.value] ?? []).join(', ')
-      }
+    if (props.canaryOf) {
+      fillFromRule(props.canaryOf.canary)
+      return
+    }
+    if (props.selected) {
+      fillFromRule(props.selected)
     } else {
       Object.assign(form, blank())
       for (const d of DIMENSIONS) matcherText[d.value] = ''
@@ -170,6 +193,12 @@ async function save() {
   }
   saving.value = true
   try {
+    if (isCanaryMode.value && props.canaryOf) {
+      // Editing the new version of an in-flight rollout: update canary content
+      // at the current percent (the live rule stays untouched until promote).
+      emit('canary-saved', { id: props.canaryOf.rule_id, draft: payload })
+      return
+    }
     const saved = editingId.value
       ? await api.updateRule(editingId.value, payload)
       : await api.createRule(payload)
@@ -180,6 +209,49 @@ async function save() {
     saving.value = false
   }
 }
+
+// Start a gray change for an existing rule: the edited content becomes the
+// canary and starts judging only `canaryPercent`% of subjects.
+function startCanary() {
+  error.value = ''
+  const v = clientValidate()
+  if (v) {
+    error.value = v
+    return
+  }
+  const pct = Number(canaryPercentInput.value)
+  if (!Number.isInteger(pct) || pct < 0 || pct > 100) {
+    error.value = '放量比例必须是 0 到 100 之间的整数'
+    return
+  }
+  const matchers: RuleDraft['matchers'] = {}
+  for (const d of form.dimensions) {
+    const txt = (matcherText[d] ?? '').trim()
+    if (txt) {
+      matchers[d] = txt
+        .split(/[,，\n]/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+    }
+  }
+  const payload: RuleDraft = {
+    name: form.name.trim(),
+    enabled: form.enabled,
+    algorithm: form.algorithm,
+    dimensions: [...form.dimensions],
+    levels: JSON.parse(JSON.stringify(form.levels)),
+    matchers,
+  }
+  if (!editingId.value) {
+    error.value = '请先创建规则，再对其发起一次灰度改动'
+    return
+  }
+  emit('start-canary', { id: editingId.value!, draft: payload, percent: pct })
+}
+
+const canStartCanary = computed(
+  () => !!editingId.value && !isCanaryMode.value && !props.existingRollout,
+)
 
 async function remove() {
   if (!editingId.value) return
@@ -196,7 +268,13 @@ async function remove() {
 
 <template>
   <div class="panel">
-    <h2>{{ editingId ? '编辑规则' : '新建规则' }}</h2>
+    <h2>
+      {{ isCanaryMode ? '编辑灰度新版本（canary）' : editingId ? '编辑规则' : '新建规则' }}
+    </h2>
+    <div v-if="isCanaryMode" class="verdict-box" style="margin-bottom:10px">
+      正在编辑这条规则<strong>放量中的新版本</strong>；当前生效的旧规则保持不变，保存后只替换 canary 内容，比例维持
+      <strong>{{ canaryOf?.percent }}%</strong>。
+    </div>
     <div v-if="error" class="error">{{ error }}</div>
 
     <label class="field">
@@ -266,10 +344,42 @@ async function remove() {
       规则启用（停用后不再参与判定）
     </label>
 
+    <div v-if="canStartCanary" class="canary-box">
+      <div class="lbl" style="margin-bottom:6px">灰度放量（可选）</div>
+      <div class="muted" style="font-size:12px;margin-bottom:8px">
+        不直接全量：先只让一部分判定主体按新规则判定，其余继续走旧规则；比例可随时调整，中止即瞬间回退。
+      </div>
+      <div class="row" style="gap:8px;align-items:center">
+        <label class="field" style="margin:0;flex:0 0 120px">
+          <span class="lbl">初始放量比例 %</span>
+          <input v-model="canaryPercentInput" type="number" min="0" max="100" step="1" />
+        </label>
+        <button type="button" class="secondary" :disabled="saving" @click="startCanary">
+          以灰度方式保存这次改动
+        </button>
+      </div>
+    </div>
+    <div v-if="existingRollout && !isCanaryMode" class="verdict-box" style="margin-bottom:10px">
+      该规则正在灰度放量 <strong>{{ existingRollout.percent }}%</strong>，直接「保存热更新」会被拒绝；
+      请在右侧调整比例，或点「编辑新版本内容」修改新规则。
+    </div>
+
     <div class="row">
-      <button @click="save" :disabled="saving">{{ editingId ? '保存热更新' : '创建规则' }}</button>
-      <button v-if="editingId" class="danger" @click="remove">删除</button>
-      <button v-if="editingId" class="secondary" @click="emit('canceled')">取消</button>
+      <button @click="save" :disabled="saving">
+        {{ isCanaryMode ? '保存新版本内容' : editingId ? '保存热更新' : '创建规则' }}
+      </button>
+      <button v-if="isCanaryMode" class="secondary" @click="emit('canary-canceled')">返回</button>
+      <button v-if="editingId && !isCanaryMode" class="danger" @click="remove">删除</button>
+      <button v-if="editingId && !isCanaryMode" class="secondary" @click="emit('canceled')">取消</button>
     </div>
   </div>
 </template>
+
+<style scoped>
+.canary-box {
+  border: 1px dashed #f5a623;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+</style>

@@ -25,7 +25,7 @@ func validRule() *model.Rule {
 // TestInvalidConfigsRejected: every malformed configuration is refused with a
 // reason; the gateway never persists or runs a bad rule.
 func TestInvalidConfigsRejected(t *testing.T) {
-	_, rs, _, _ := testboot.FullStack(t)
+	_, rs, _, _, _ := testboot.FullStack(t)
 	ctx := context.Background()
 
 	bad := []struct {
@@ -129,7 +129,7 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 
 // TestUpdateAndDelete: illegal updates rejected, delete takes effect.
 func TestUpdateAndDelete(t *testing.T) {
-	_, rs, _, _ := testboot.FullStack(t)
+	_, rs, _, _, _ := testboot.FullStack(t)
 	ctx := context.Background()
 	r, err := rs.Create(ctx, validRule())
 	if err != nil {

@@ -8,7 +8,8 @@
 * **四级配额并存**：全局 / 分组 / 接口 / 客户端逐级校验，任一级超限即拒绝，并在响应里说明是哪一级、哪条规则挡下的。
 * **Redis 共享计数**：所有判定逻辑在单个 Lua 脚本内原子完成，多个网关实例共享同一份配额，并发与横向扩容都不超发。
 * **规则热生效**：改阈值无需重启，经 Redis Pub/Sub 推送到所有实例；规则持久化在 PostgreSQL，重启后语义不变。
-* **实时观测台**：每秒放行/拒绝曲线、各级令牌余量或窗口占用、最近被拒请求命中的规则与级别，并可在页面上发压/回放流量。
+* **规则灰度放量（canary）**：一次改动可先只让一小部分判定主体按新版本判定、其余继续走旧版本；比例随时 10%→50%→100% 调整，到 100% 收口全量，调回 0 或一键中止则全部流量瞬间回到旧版本。分桶确定性、可复现（FNV-1a 哈希到 100 个桶），放量单调只增不减、不重新洗牌；新旧两个版本各自独立占用配额计数，互不挪用；灰度状态同样持久化 PostgreSQL 并经 Redis Pub/Sub 多实例热同步，重启不丢。
+* **实时观测台**：每秒放行/拒绝曲线、各级令牌余量或窗口占用、最近被拒请求命中的规则与级别，并可在页面上发压/回放流量；灰度期间新版本与旧版本的放行/拒绝走势、配额占用分别呈现。
 
 ---
 
@@ -43,6 +44,20 @@ docker compose up -d --scale backend=3
 4. **窗口边界对比**：分别建固定窗口与滑动窗口（阈值 50、窗口 1s），在窗口尾与下一窗口初各打一批；固定窗口跨边界放两倍（50+50），滑动窗口不会（50+少量）。
 5. **多客户端隔离**：规则维度勾 `client_id + api_path`，A 客户端打满 /orders 不影响 B 客户端，也不影响 A 自己的其他接口。
 6. **四级配额**：一条规则同时配置 global/group/api/client，任一级最紧就由那一级挡下，429 响应里写明 `level` 与 `reason`。
+7. **灰度放量**：选中一条已存在的规则，编辑出更紧的新版本（例如客户端配额 100→20），在底部填初始放量比例 10 并点「以灰度方式保存这次改动」。右侧出现灰度控制条与新旧两版各自的曲线；在发压板把「分散到 N 个判定主体」设为 100 回放，可看到约 10% 主体走新版、其余走旧版，反复回放分流不变。逐步把比例调到 50、100，已在新桶里的主体不会被洗回去；点「中止放量/回退」则全部流量瞬间回到旧版本。
+
+---
+
+## 灰度放量（canary）是怎么判定的
+
+灰度分桶与版本选择是一个**独立、纯函数、可单测的层**（`internal/canary/`），不掺进判定循环：
+
+* **主体（subject）**：取规则声明的那组维度值，按声明顺序拼成确定性身份（如 `client_id=42|api_path=/x`），整次放量期间由旧版本维度锚定。
+* **分桶**：`bucket = FNV-1a(长度前缀(ruleID) + 长度前缀(subject)) mod 100`，落在固定的 `[0,99]`。
+* **版本选择**：`bucket < percent → canary`，否则 `stable`。因为新版集合是前缀 `[0,percent)`，比例从小调大时只增不删地把主体搬进新版本，**绝不重新洗牌**；比例为 0 全部走旧版，100 全部走新版。
+* **跨实例一致**：归属只依赖 `(ruleID, subject, percent)`，任何实例、任何时刻算出的结果都一样，同一笔请求落到哪个网关都进同一版本。
+* **配额隔离**：新版本的计数键多一段 `canary`（`rl:{id}:canary:level:...`），与旧版本 `rl:{id}:level:...` 完全是两套计数；中止后新版计数留在 Redis 但不再被任何判定读取。
+* **响应可见**：放行/拒绝响应里每条命中规则都带 `version`（`stable` / `canary`），便于排查「为什么同一接口两个客户体验不一样」。
 
 ---
 
@@ -83,24 +98,28 @@ backend/
       sliding_log.go              滑动日志 Lua
       *_multi.go                  各算法的四级 N-key 原子脚本
       multi.go                    TryMulti 调度
-    matcher/matcher.go            多维 AND 匹配 + 独立维度值 Redis key
-    quota/checker.go              四级配额级联判定 + 统计
+    matcher/matcher.go            多维 AND 匹配 + 独立维度值 Redis key（含版本隔离键）
+    canary/canary.go              灰度分桶 + 纯函数版本选择 + Rollout 校验（独立一层，可单测）
+    quota/checker.go              灰度版本选择 + 四级配额级联判定 + 统计
     store/rule_store.go           PostgreSQL 持久化 + 内存缓存 + Pub/Sub 热更新
-    stats/stats.go                每秒放行/拒绝时序、最近拒绝日志
+    store/rollout_store.go        灰度状态（比例/新旧两版内容）PG 持久化 + Pub/Sub 热同步
+    stats/stats.go                每秒放行/拒绝时序、最近拒绝日志（按 stable/canary 分版本）
     api/
       server.go                   路由、网关判定入口 /api/gateway/check
       rules.go                    规则 CRUD（严格 JSON 校验）
-      metrics.go                  时序/拒绝/概览
-      state.go                    余量与活动 key
-      replay.go                   发压/回放
+      rollout.go                  灰度启动 / 调比例 / 全量收口 / 中止
+      metrics.go                  时序/拒绝/概览（支持 version=stable|canary）
+      state.go                    余量与活动 key（新旧两版分别 peek）
+      replay.go                   发压/回放（可分散到 N 个主体观察分流）
 frontend/
   src/
     App.vue
     components/
       RuleList.vue                规则列表
-      RuleEditor.vue              规则编辑组件（算法/维度/各级阈值）
-      ObserverPanel.vue           实时观测面板（曲线/余量/拒绝表）
-      TrafficGenerator.vue        发压与回放
+      RuleEditor.vue              规则编辑组件（算法/维度/各级阈值/初始灰度比例）
+      CanaryPanel.vue             灰度比例控制（预设百分比/全量收口/中止回退）
+      ObserverPanel.vue           实时观测面板（新旧两版曲线/余量/拒绝表）
+      TrafficGenerator.vue        发压与回放（多主体分流，按版本着色）
       LiveChart.vue               SVG 实时曲线
     lib/{api.ts,types.ts}
 ```
@@ -112,12 +131,17 @@ frontend/
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET/POST | `/api/rules` | 列表 / 创建（非法配置返回 400 与原因） |
-| GET/PUT/DELETE | `/api/rules/:id` | 查看 / 更新（热生效）/ 删除 |
-| POST | `/api/gateway/check` | **真正的判定入口**，body：`client_id/api_path/group`，放行 200、拒绝 429 |
-| GET | `/api/metrics/timeseries?rule_id=&seconds=` | 每秒 allow/deny |
-| GET | `/api/metrics/denies?rule_id=` | 最近被拒请求 |
-| GET | `/api/rules/:id/state` | 当前余量 / 窗口占用 / 活动 key |
-| POST | `/api/tools/replay` | 按批发压，返回每笔判定序列 |
+| GET/PUT/DELETE | `/api/rules/:id` | 查看 / 更新（热生效；有进行中放量时直接改旧规则返回 409）/ 删除 |
+| GET | `/api/rollouts` | 列出所有进行中的灰度（比例 + 新旧两版内容） |
+| POST | `/api/rules/:id/rollout` | 启动灰度：`{percent:10, canary:{...新规则...}}` |
+| PUT | `/api/rules/:id/rollout` | 调整比例 `{percent:50}`，可顺带替换 `canary` 内容 |
+| POST | `/api/rules/:id/rollout/promote` | 100% 收口：新版本成为唯一规则，放量结束 |
+| DELETE | `/api/rules/:id/rollout` | 中止放量：全部流量瞬间回到旧版本 |
+| POST | `/api/gateway/check` | **真正的判定入口**，body：`client_id/api_path/group`，放行 200、拒绝 429（均带 `version`） |
+| GET | `/api/metrics/timeseries?rule_id=&seconds=&version=stable\|canary` | 每秒 allow/deny（按版本） |
+| GET | `/api/metrics/denies?rule_id=&version=` | 最近被拒请求（不带 version 取两版合计） |
+| GET | `/api/rules/:id/state` | 当前余量 / 窗口占用 / 活动 key（灰度时含两版 peek） |
+| POST | `/api/tools/replay` | 按批发压，返回每笔判定序列；`distinct_clients=N` 分散到 N 个主体观察分流 |
 
 429 响应示例：
 
@@ -157,6 +181,17 @@ go test ./... -p 1
 * 并发（含模拟两个网关实例共享一份 Redis）计数绝不超发；
 * 规则热更新即刻生效；
 * 非法配置（阈值非正、维度值缺失、算法未知、窗口非法等）全部被拒并给出原因。
+
+灰度放量锁定的行为（真实 Redis + 嵌入式 PostgreSQL，非 mock）：
+
+* **主体稳定**：比例不变期间，同一个判定主体反复判定始终落在同一版本；
+* **单调放量**：比例从小调大时，原已在新版本的主体全部保留、只新增不剔除，不重新洗牌；
+* **可复现 / 跨实例一致**：给定 `(规则, 比例, 主体)` 版本归属唯一确定，多个独立判定路径（模拟多实例）算出的归属完全一致；
+* **配额隔离**：新旧两版各自独立计数，新版客户端打满不影响同一主体在旧版的余量（Redis 键物理分离），反之亦然；
+* **中止 / 归零即回退**：中止或比例归零后全部流量立即回到旧版本，新版计数不再影响任何判定；
+* **比例校验**：越界（<0、>100）与非数值比例一律 400 拒绝并说明原因；灰度中的非法新版本同样按既有规则校验被拒；
+* **重启不丢**：放量（哪条规则、当前比例、新旧两版内容）持久化 PostgreSQL，重启或新实例加入后按原比例继续分流，已在新桶的主体依旧在新桶；
+* **多实例热同步**：任一实例调整比例，其余实例经 Redis Pub/Sub 即时按新比例分流。
 
 ---
 

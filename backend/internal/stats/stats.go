@@ -30,7 +30,16 @@ type DenyEvent struct {
 	APIPath   string `json:"api_path"`
 	Group     string `json:"group"`
 	Remaining int64  `json:"remaining"`
+	// Version is "stable" or "canary": which rule version rejected the
+	// request during a gray rollout. Empty for the pre-rollout aggregate.
+	Version string `json:"version,omitempty"`
 }
+
+// Version labels used in Redis keys and on the wire.
+const (
+	VersionStable = "stable"
+	VersionCanary = "canary"
+)
 
 // Point holds the outcomes recorded in one second bucket.
 type Point struct {
@@ -45,26 +54,30 @@ type Recorder struct {
 
 func New(rdb *redis.Client) *Recorder { return &Recorder{rdb: rdb} }
 
-func tsKey(ruleID string, outcome string) string {
-	return fmt.Sprintf("stat:{%s}:%s", ruleID, outcome)
+func tsKey(ruleID, version, outcome string) string {
+	return fmt.Sprintf("stat:{%s}:%s:%s", ruleID, version, outcome)
 }
-func denyKey(ruleID string) string { return fmt.Sprintf("deny:{%s}", ruleID) }
+func denyKey(ruleID, version string) string {
+	return fmt.Sprintf("deny:{%s}:%s", ruleID, version)
+}
 
-func outcomeKey(ruleID string, allowed bool) string {
+func outcomeKey(ruleID, version string, allowed bool) string {
 	if allowed {
-		return tsKey(ruleID, "allow")
+		return tsKey(ruleID, version, "allow")
 	}
-	return tsKey(ruleID, "deny")
+	return tsKey(ruleID, version, "deny")
 }
 
-// Tick records one evaluated request for a rule. The timestamp is supplied by
-// the caller: for the leaky bucket it is the request's paced release time so
-// the allow curve reflects shaped output rather than arrival. Call in a
-// pipeline to avoid extra round trips.
-func Tick(pipe redis.Pipeliner, ruleID string, allowed bool, at time.Time) {
+// Tick records one evaluated request for a rule version. The timestamp is
+// supplied by the caller: for the leaky bucket it is the request's paced
+// release time so the allow curve reflects shaped output rather than arrival.
+// Stable and canary series are kept in separate keys so the dashboard can draw
+// the two versions' curves independently. Call in a pipeline to avoid extra
+// round trips.
+func Tick(pipe redis.Pipeliner, ruleID, version string, allowed bool, at time.Time) {
 	sec := strconv.FormatInt(at.Unix(), 10)
-	k1 := outcomeKey(ruleID, allowed)
-	k2 := outcomeKey("_all", allowed)
+	k1 := outcomeKey(ruleID, version, allowed)
+	k2 := outcomeKey("_all", VersionStable, allowed)
 	pipe.ZIncrBy(context.Background(), k1, 1, sec)
 	pipe.ZIncrBy(context.Background(), k2, 1, sec)
 	// Refresh retention so idle series keys are eventually reclaimed.
@@ -73,19 +86,23 @@ func Tick(pipe redis.Pipeliner, ruleID string, allowed bool, at time.Time) {
 }
 
 // ExpireTS sets retention on the time-series keys (best effort).
-func (r *Recorder) ExpireTS(ctx context.Context, ruleID string) {
-	for _, k := range []string{tsKey(ruleID, "allow"), tsKey(ruleID, "deny")} {
+func (r *Recorder) ExpireTS(ctx context.Context, ruleID, version string) {
+	for _, k := range []string{tsKey(ruleID, version, "allow"), tsKey(ruleID, version, "deny")} {
 		_ = r.rdb.Expire(ctx, k, tsTTL).Err()
 	}
 }
 
-// PushDeny appends a rejection to the rule's capped log.
+// PushDeny appends a rejection to the rule version's capped log.
 func (r *Recorder) PushDeny(ctx context.Context, e DenyEvent) error {
 	raw, err := json.Marshal(e)
 	if err != nil {
 		return err
 	}
-	k := denyKey(e.RuleID)
+	version := e.Version
+	if version == "" {
+		version = VersionStable
+	}
+	k := denyKey(e.RuleID, version)
 	pipe := r.rdb.TxPipeline()
 	pipe.LPush(ctx, k, raw)
 	pipe.LTrim(ctx, k, 0, denyLogLen-1)
@@ -94,20 +111,24 @@ func (r *Recorder) PushDeny(ctx context.Context, e DenyEvent) error {
 	return err
 }
 
-// TimeSeries returns the last `seconds` seconds of allow/deny counts,
-// zero-filling seconds with no events.
-func (r *Recorder) TimeSeries(ctx context.Context, ruleID string, seconds int64) ([]Point, error) {
+// TimeSeries returns the last `seconds` seconds of allow/deny counts for one
+// rule version, zero-filling seconds with no events. Pass version "" to read
+// the stable (pre-rollout) series; ruleID "" reads the global aggregate.
+func (r *Recorder) TimeSeries(ctx context.Context, ruleID, version string, seconds int64) ([]Point, error) {
+	if version == "" {
+		version = VersionStable
+	}
 	if ruleID == "" {
 		ruleID = "_all"
 	}
 	now := time.Now().Unix()
 	cutoff := now - seconds + 1
 
-	allow, err := r.rangeCounts(ctx, tsKey(ruleID, "allow"), cutoff)
+	allow, err := r.rangeCounts(ctx, tsKey(ruleID, version, "allow"), cutoff)
 	if err != nil {
 		return nil, err
 	}
-	deny, err := r.rangeCounts(ctx, tsKey(ruleID, "deny"), cutoff)
+	deny, err := r.rangeCounts(ctx, tsKey(ruleID, version, "deny"), cutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -139,17 +160,30 @@ func (r *Recorder) rangeCounts(ctx context.Context, key string, cutoff int64) (m
 }
 
 // RecentDenies returns the newest rejection events for a rule (or all rules).
-func (r *Recorder) RecentDenies(ctx context.Context, ruleID string, limit int64) ([]DenyEvent, error) {
+// version "" reads both stable and canary logs; pass stats.VersionCanary etc.
+// to narrow to one rule version.
+func (r *Recorder) RecentDenies(ctx context.Context, ruleID, version string, limit int64) ([]DenyEvent, error) {
 	if limit <= 0 || limit > denyLogLen {
 		limit = denyLogLen
 	}
 	if ruleID != "" {
-		return r.popDenies(ctx, denyKey(ruleID), limit)
+		if version != "" {
+			return r.popDenies(ctx, denyKey(ruleID, version), limit)
+		}
+		var all []DenyEvent
+		for _, v := range []string{VersionStable, VersionCanary} {
+			evs, err := r.popDenies(ctx, denyKey(ruleID, v), limit)
+			if err != nil {
+				return nil, err
+			}
+			all = append(all, evs...)
+		}
+		return sortAndCap(all, limit), nil
 	}
 	var keys []string
 	var cursor uint64
 	for {
-		batch, next, err := r.rdb.Scan(ctx, cursor, "deny:{*}", 200).Result()
+		batch, next, err := r.rdb.Scan(ctx, cursor, "deny:{*}:*", 200).Result()
 		if err != nil {
 			return nil, err
 		}
@@ -161,13 +195,19 @@ func (r *Recorder) RecentDenies(ctx context.Context, ruleID string, limit int64)
 	}
 	var all []DenyEvent
 	for _, k := range keys {
+		if version != "" && !strings.HasSuffix(k, ":"+version) {
+			continue
+		}
 		evs, err := r.popDenies(ctx, k, limit)
 		if err != nil {
 			return nil, err
 		}
 		all = append(all, evs...)
 	}
-	// newest first, cap to limit
+	return sortAndCap(all, limit), nil
+}
+
+func sortAndCap(all []DenyEvent, limit int64) []DenyEvent {
 	for i := 1; i < len(all); i++ {
 		for j := i; j > 0 && all[j-1].TimeMs < all[j].TimeMs; j-- {
 			all[j-1], all[j] = all[j], all[j-1]
@@ -176,7 +216,7 @@ func (r *Recorder) RecentDenies(ctx context.Context, ruleID string, limit int64)
 	if int64(len(all)) > limit {
 		all = all[:limit]
 	}
-	return all, nil
+	return all
 }
 
 func (r *Recorder) popDenies(ctx context.Context, key string, limit int64) ([]DenyEvent, error) {

@@ -57,10 +57,15 @@ func truncateRules(t *testing.T) {
 	}
 	defer pool.Close()
 	// Tolerate the very first run, before store.New has created the schema.
+	// Both tables are truncated in one statement because Postgres forbids
+	// truncating a table referenced by an FK even when the child is empty.
 	_, err = pool.Exec(context.Background(), `
 DO $$
 BEGIN
-  IF EXISTS (SELECT FROM pg_tables WHERE schemaname='public' AND tablename='rules') THEN
+  IF EXISTS (SELECT FROM pg_tables WHERE schemaname='public' AND tablename='rules')
+     AND EXISTS (SELECT FROM pg_tables WHERE schemaname='public' AND tablename='rule_rollouts') THEN
+    EXECUTE 'TRUNCATE rules, rule_rollouts';
+  ELSIF EXISTS (SELECT FROM pg_tables WHERE schemaname='public' AND tablename='rules') THEN
     EXECUTE 'TRUNCATE rules';
   END IF;
 END $$;`)
@@ -81,8 +86,8 @@ func RedisOnly(t *testing.T) (*redis.Client, *engine.Manager) {
 }
 
 // FullStack truncates persisted rules, flushes Redis and wires the store +
-// engine manager + recorder, giving every test a clean slate.
-func FullStack(t *testing.T) (*redis.Client, *store.RuleStore, *engine.Manager, *stats.Recorder) {
+// rollout store + engine manager + recorder, giving every test a clean slate.
+func FullStack(t *testing.T) (*redis.Client, *store.RuleStore, *store.RolloutStore, *engine.Manager, *stats.Recorder) {
 	t.Helper()
 	truncateRules(t)
 	rdb := NewRedis(t, redisDB)
@@ -92,11 +97,17 @@ func FullStack(t *testing.T) (*redis.Client, *store.RuleStore, *engine.Manager, 
 		t.Fatalf("rule store: %v", err)
 	}
 	go rules.SubscribeHotReload(ctx)
+	rollouts, err := store.NewRolloutStore(ctx, rules.PgPool(), rdb)
+	if err != nil {
+		t.Fatalf("rollout store: %v", err)
+	}
+	rules.AttachRollouts(rollouts)
+	go rollouts.SubscribeHotReload(ctx)
 	mgr, err := engine.NewManager(ctx, rdb)
 	if err != nil {
 		t.Fatalf("engine manager: %v", err)
 	}
-	return rdb, rules, mgr, stats.New(rdb)
+	return rdb, rules, rollouts, mgr, stats.New(rdb)
 }
 
 func uintToStr(v uint32) string {

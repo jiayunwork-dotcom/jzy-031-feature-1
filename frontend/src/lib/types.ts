@@ -37,6 +37,17 @@ export interface RuleDraft {
   matchers: Partial<Record<Dimension, string[]>>
 }
 
+export type RolloutVersion = 'stable' | 'canary'
+
+// Rollout is one in-flight gray change: percent of traffic judged by the
+// canary (new) rule, plus the frozen old and new rule contents.
+export interface Rollout {
+  rule_id: string
+  percent: number
+  canary: Rule
+  old: Rule
+}
+
 export interface LevelResult {
   level: Level
   allowed: boolean
@@ -46,20 +57,24 @@ export interface LevelResult {
   key: string
 }
 
+export interface RuleResult {
+  rule_id: string
+  rule_name: string
+  allowed: boolean
+  version?: RolloutVersion | ''
+  deny_level?: Level
+  reason?: string
+  levels: LevelResult[]
+}
+
 export interface Verdict {
   allowed: boolean
   rule_id?: string
   rule_name?: string
   level?: Level
+  version?: RolloutVersion | ''
   reason?: string
-  results: Array<{
-    rule_id: string
-    rule_name: string
-    allowed: boolean
-    deny_level?: Level
-    reason?: string
-    levels: LevelResult[]
-  }>
+  results: RuleResult[]
 }
 
 export interface Point {
@@ -78,12 +93,32 @@ export interface DenyEvent {
   api_path: string
   group: string
   remaining: number
+  version?: RolloutVersion
 }
 
 export interface ActiveKey {
   level: string
+  version?: RolloutVersion
   key: string
   remaining: number
   reset_in_ms: number
   kind: string
+}
+
+export interface ReplayItem {
+  seq: number
+  allowed: boolean
+  time_ms: number
+  rule_id?: string
+  level?: string
+  version?: RolloutVersion | ''
+  reason?: string
+}
+
+export interface ReplayResult {
+  total: number
+  allowed: number
+  denied: number
+  by_version?: Record<string, { allowed: number; denied: number }>
+  items: ReplayItem[]
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 
@@ -100,6 +101,16 @@ func (s *Server) updateRule(c *gin.Context) {
 	r, err := toModel(&p)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	// While a gray rollout is in flight the live rule is the frozen "old"
+	// snapshot; the operator must change the canary (or abort) rather than
+	// silently moving the baseline the rollout compares against.
+	if ro, ok := s.rollouts.Get(p.ID); ok {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "rule has an in-flight rollout at " +
+				strconv.Itoa(ro.Percent) + "%; adjust the canary, promote it at 100%, or abort it before editing the live rule",
+		})
 		return
 	}
 	updated, err := s.rules.Update(c.Request.Context(), r)

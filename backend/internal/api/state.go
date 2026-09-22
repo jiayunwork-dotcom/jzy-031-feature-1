@@ -23,6 +23,7 @@ type redisStateReader interface {
 // activeKey describes one live bucket/window for the dashboard.
 type activeKey struct {
 	Level     string `json:"level"`
+	Version   string `json:"version,omitempty"`
 	Key       string `json:"key"`
 	Remaining int64  `json:"remaining"`
 	ResetInMs int64  `json:"reset_in_ms"`
@@ -31,7 +32,8 @@ type activeKey struct {
 
 // ruleState scans Redis for a rule's active buckets and peeks each one.
 // Query params client_id / api_path / group let the dashboard pick which
-// concrete dimension combination to read.
+// concrete dimension combination to read. While a rollout is in flight it
+// returns separate stable and canary peeks, plus the rollout descriptor.
 func (s *Server) ruleState(c *gin.Context) {
 	id := c.Param("id")
 	rule, ok := s.rules.Get(id)
@@ -55,11 +57,26 @@ func (s *Server) ruleState(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"rule":        rule,
 		"selected":    levels,
 		"active_keys": live,
-	})
+	}
+
+	// Gray rollout: expose both versions' rule content and isolated peeks.
+	if ro, ok := s.rollouts.Get(id); ok {
+		stableLevels := s.checker.PeekRuleVersion(c.Request.Context(), &ro.Old, rctx, "")
+		canaryLevels := s.checker.PeekRuleVersion(c.Request.Context(), &ro.Canary, rctx, "canary")
+		resp["rollout"] = gin.H{
+			"percent": ro.Percent,
+			"canary":  ro.Canary,
+			"old":     ro.Old,
+		}
+		resp["stable_selected"] = stableLevels
+		resp["canary_selected"] = canaryLevels
+	}
+
+	c.JSON(http.StatusOK, resp)
 }
 
 func (s *Server) scanActive(ctx context.Context, ruleID string, rule *model.Rule) ([]activeKey, error) {
@@ -84,22 +101,39 @@ func (s *Server) scanActive(ctx context.Context, ruleID string, rule *model.Rule
 	out := make([]activeKey, 0, len(keys))
 	for _, k := range keys {
 		ak := activeKey{Key: k, Kind: string(rule.Algorithm)}
+		// Strip rl:{id}: then an optional canary: segment.
 		parts := strings.SplitN(k, ":", 3)
+		rest := ""
 		if len(parts) == 3 {
-			segs := strings.SplitN(parts[2], ":", 2)
+			rest = parts[2]
+		}
+		if strings.HasPrefix(rest, "canary:") {
+			ak.Version = "canary"
+			rest = strings.TrimPrefix(rest, "canary:")
+		} else {
+			ak.Version = "stable"
+		}
+		if segs := strings.SplitN(rest, ":", 2); len(segs) >= 1 {
 			ak.Level = segs[0]
+		}
+		// Canary keys belong to the canary rule content; the rest to stable.
+		effective := rule
+		if ak.Version == "canary" {
+			if ro, ok := s.rollouts.Get(ruleID); ok {
+				effective = &ro.Canary
+			}
 		}
 		switch rule.Algorithm {
 		case model.AlgoSlidingLog:
 			n, err := s.redis.ZCard(ctx, k).Result()
 			if err == nil {
-				cfg := rule.Levels[model.Level(ak.Level)]
+				cfg := effective.Levels[model.Level(ak.Level)]
 				ak.Remaining = cfg.Threshold - n
 			}
 		default:
 			m, err := s.redis.HGetAll(ctx, k).Result()
 			if err == nil {
-				ak.Remaining = interpretRemaining(rule, ak.Level, m)
+				ak.Remaining = interpretRemaining(effective, ak.Level, m)
 			}
 		}
 		out = append(out, ak)

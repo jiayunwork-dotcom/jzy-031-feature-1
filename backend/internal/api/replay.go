@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -23,6 +24,12 @@ type replayReq struct {
 	ClientID   string `json:"client_id"`
 	APIPath    string `json:"api_path"`
 	Group      string `json:"group"`
+	// DistinctClients > 0 spreads the load across that many deterministic
+	// subjects (client-0..client-N-1) instead of hammering one client, so a
+	// gray rollout's proportional split is directly observable. The mapping
+	// is stable: replaying the same batch assigns the same subjects to the
+	// same versions.
+	DistinctClients int `json:"distinct_clients"`
 }
 
 type replayItem struct {
@@ -31,6 +38,7 @@ type replayItem struct {
 	TimeMs  int64  `json:"time_ms"`
 	RuleID  string `json:"rule_id,omitempty"`
 	Level   string `json:"level,omitempty"`
+	Version string `json:"version,omitempty"`
 	Reason  string `json:"reason,omitempty"`
 }
 
@@ -51,8 +59,22 @@ func (s *Server) replay(c *gin.Context) {
 		req.APIPath = "/"
 	}
 
-	rctx := model.RequestContext{ClientID: req.ClientID, APIPath: req.APIPath, Group: req.Group}
+	base := model.RequestContext{ClientID: req.ClientID, APIPath: req.APIPath, Group: req.Group}
+	if req.DistinctClients < 0 {
+		req.DistinctClients = 0
+	}
 	results := make([]replayItem, req.Count)
+
+	rctxFor := func(i int) model.RequestContext {
+		if req.DistinctClients <= 0 {
+			return base
+		}
+		rc := base
+		// Deterministic spread across N subjects; the same index always maps
+		// to the same client, so replays are reproducible.
+		rc.ClientID = req.ClientID + "-" + strconv.Itoa(i%req.DistinctClients)
+		return rc
+	}
 
 	for start := 0; start < req.Count; start += req.Batch {
 		n := req.Batch
@@ -65,8 +87,8 @@ func (s *Server) replay(c *gin.Context) {
 			i := start + j
 			go func() {
 				defer wg.Done()
-				v, err := s.checker.Decide(context.Background(), rctx)
-				item := replayItem{Seq: i, TimeMs: time.Now().UnixMilli()}
+				v, err := s.checker.Decide(context.Background(), rctxFor(i))
+				item := replayItem{Seq: i, TimeMs: time.Now().UnixMilli(), Version: v.Version}
 				if err != nil {
 					item.Reason = err.Error()
 				} else {
@@ -85,15 +107,26 @@ func (s *Server) replay(c *gin.Context) {
 	}
 
 	var allowed, denied int
+	versionTotals := map[string]map[string]int{}
 	for _, r := range results {
+		v := r.Version
+		if v == "" {
+			v = "stable"
+		}
+		if versionTotals[v] == nil {
+			versionTotals[v] = map[string]int{}
+		}
 		if r.Allowed {
 			allowed++
+			versionTotals[v]["allowed"]++
 		} else {
 			denied++
+			versionTotals[v]["denied"]++
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"total": len(results), "allowed": allowed, "denied": denied,
-		"items": results,
+		"by_version": versionTotals,
+		"items":      results,
 	})
 }

@@ -18,21 +18,22 @@ import (
 )
 
 type Server struct {
-	cfg     config.Config
-	rules   *store.RuleStore
-	engines *engine.Manager
-	checker *quota.Checker
-	rec     *stats.Recorder
-	match   *matcher.Matcher
-	redis   redisStateReader
+	cfg      config.Config
+	rules    *store.RuleStore
+	rollouts *store.RolloutStore
+	engines  *engine.Manager
+	checker  *quota.Checker
+	rec      *stats.Recorder
+	match    *matcher.Matcher
+	redis    redisStateReader
 }
 
 // NewServer wires the router. The redis client is passed as an interface so
 // the state endpoints can SCAN keys.
-func NewServer(cfg config.Config, rules *store.RuleStore, engines *engine.Manager,
-	rec *stats.Recorder, checker *quota.Checker, rsr redisStateReader) *Server {
+func NewServer(cfg config.Config, rules *store.RuleStore, rollouts *store.RolloutStore,
+	engines *engine.Manager, rec *stats.Recorder, checker *quota.Checker, rsr redisStateReader) *Server {
 	s := &Server{
-		cfg: cfg, rules: rules, engines: engines, rec: rec,
+		cfg: cfg, rules: rules, rollouts: rollouts, engines: engines, rec: rec,
 		checker: checker, match: matcher.New(), redis: rsr,
 	}
 	return s
@@ -58,6 +59,13 @@ func (s *Server) Router() *gin.Engine {
 		api.GET("/rules/:id", s.getRule)
 		api.PUT("/rules/:id", s.updateRule)
 		api.DELETE("/rules/:id", s.deleteRule)
+
+		// gray rollout (canary) control
+		api.GET("/rollouts", s.listRollouts)
+		api.POST("/rules/:id/rollout", s.startRollout)
+		api.PUT("/rules/:id/rollout", s.updateRollout)
+		api.POST("/rules/:id/rollout/promote", s.promoteRollout)
+		api.DELETE("/rules/:id/rollout", s.abortRollout)
 
 		// the real gateway ingress: a decision per request
 		api.POST("/gateway/check", s.gatewayCheck)
@@ -104,6 +112,7 @@ func (s *Server) gatewayCheck(c *gin.Context) {
 	if v.Allowed {
 		c.JSON(http.StatusOK, gin.H{
 			"allowed": true,
+			"version": v.Version,
 			"results": v.Results,
 		})
 		return
@@ -113,6 +122,7 @@ func (s *Server) gatewayCheck(c *gin.Context) {
 		"rule_id":   v.RuleID,
 		"rule_name": v.RuleName,
 		"level":     string(v.Level),
+		"version":   v.Version,
 		"reason":    v.Reason,
 		"results":   v.Results,
 	})

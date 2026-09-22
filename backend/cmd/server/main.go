@@ -45,14 +45,24 @@ func main() {
 
 	go rules.SubscribeHotReload(ctx)
 
+	// Gray-rollout state lives in the same Postgres + Redis and hot-syncs over
+	// its own pub/sub channel, so an instance restart or a freshly added
+	// replica resumes every in-flight rollout at the exact prior percent.
+	rollouts, err := store.NewRolloutStore(ctx, rules.PgPool(), rdb)
+	if err != nil {
+		log.Fatalf("rollout store not ready: %v", err)
+	}
+	rules.AttachRollouts(rollouts)
+	go rollouts.SubscribeHotReload(ctx)
+
 	engines, err := engine.NewManager(ctx, rdb)
 	if err != nil {
 		log.Fatalf("init engines: %v", err)
 	}
 	rec := stats.New(rdb)
-	checker := quota.New(rules, engines, rdb, rec)
+	checker := quota.New(rules, rollouts, engines, rdb, rec)
 
-	srv := api.NewServer(cfg, rules, engines, rec, checker, rdb)
+	srv := api.NewServer(cfg, rules, rollouts, engines, rec, checker, rdb)
 	httpServer := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           srv.Router(),

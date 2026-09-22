@@ -38,9 +38,17 @@ type RuleStore struct {
 	pg  *pgxpool.Pool
 	rdb *redis.Client
 
-	mu    sync.RWMutex
-	rules map[string]*model.Rule
+	mu       sync.RWMutex
+	rules    map[string]*model.Rule
+	rollouts *RolloutStore // optional: lets Delete clean up a gray rollout
 }
+
+// AttachRollouts wires the rollout store so deleting a rule also drops any
+// in-flight rollout row (cascade) and hot-caches, on every instance.
+func (s *RuleStore) AttachRollouts(rs *RolloutStore) { s.rollouts = rs }
+
+// PgPool exposes the shared connection pool (the rollout store reuses it).
+func (s *RuleStore) PgPool() *pgxpool.Pool { return s.pg }
 
 // New opens the pool, migrates the schema and loads all rules.
 func New(ctx context.Context, dsn string, rdb *redis.Client) (*RuleStore, error) {
@@ -149,7 +157,7 @@ func (s *RuleStore) Create(ctx context.Context, r *model.Rule) (*model.Rule, err
 		// explicit false stays false; a zero value on create means enabled
 	}
 	r.UpdatedAt = time.Now().UTC()
-	if err := s.upsert(ctx, r); err != nil {
+	if err := upsertRuleExec(ctx, s.pg, r); err != nil {
 		return nil, err
 	}
 	if err := s.cacheAndPublish(ctx, r); err != nil {
@@ -170,7 +178,7 @@ func (s *RuleStore) Update(ctx context.Context, r *model.Rule) (*model.Rule, err
 		return nil, ErrInvalid{err}
 	}
 	r.UpdatedAt = time.Now().UTC()
-	if err := s.upsert(ctx, r); err != nil {
+	if err := upsertRuleExec(ctx, s.pg, r); err != nil {
 		return nil, err
 	}
 	if err := s.cacheAndPublish(ctx, r); err != nil {
@@ -179,7 +187,8 @@ func (s *RuleStore) Update(ctx context.Context, r *model.Rule) (*model.Rule, err
 	return r, nil
 }
 
-// Delete removes a rule everywhere.
+// Delete removes a rule everywhere. Any in-flight gray rollout for it is
+// removed in the same transaction (rule_rollouts cascades) and hot-reloaded.
 func (s *RuleStore) Delete(ctx context.Context, id string) error {
 	if _, ok := s.Get(id); !ok {
 		return ErrNotFound{fmt.Errorf("rule %s not found", id)}
@@ -190,17 +199,33 @@ func (s *RuleStore) Delete(ctx context.Context, id string) error {
 	s.mu.Lock()
 	delete(s.rules, id)
 	s.mu.Unlock()
-	return s.rdb.Publish(ctx, pubChannel, "delete:"+id).Err()
+	pipe := s.rdb.Pipeline()
+	pipe.Publish(ctx, pubChannel, "delete:"+id)
+	if s.rollouts != nil {
+		s.rollouts.deleteCache(id)
+		pipe.Publish(ctx, rolloutPubChannel, "reload")
+	}
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
-func (s *RuleStore) upsert(ctx context.Context, r *model.Rule) error {
+// replaceCache swaps one rule in the hot in-memory map without touching the
+// database (used by RolloutStore.Promote after its own commit).
+func (s *RuleStore) replaceCache(r *model.Rule) {
+	cp := *r
+	s.mu.Lock()
+	s.rules[r.ID] = &cp
+	s.mu.Unlock()
+}
+
+func upsertRuleExec(ctx context.Context, exec dbExec, r *model.Rule) error {
 	dims, _ := json.Marshal(r.Dimensions)
 	levels, _ := json.Marshal(r.Levels)
 	matchers, _ := json.Marshal(r.Matchers)
 	if r.Matchers == nil {
 		matchers = []byte("{}")
 	}
-	_, err := s.pg.Exec(ctx, `
+	_, err := exec.Exec(ctx, `
 		INSERT INTO rules (id, name, enabled, algorithm, dimensions, levels, matchers, updated_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
 		ON CONFLICT (id) DO UPDATE SET

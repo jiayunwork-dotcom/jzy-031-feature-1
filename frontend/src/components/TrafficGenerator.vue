@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { ref, reactive, computed } from 'vue'
-import type { Rule, Verdict } from '../lib/types'
+import type { Rollout, Rule, Verdict } from '../lib/types'
 import { api } from '../lib/api'
 
-const props = defineProps<{ rule: Rule | null }>()
+const props = defineProps<{ rule: Rule | null; rollout?: Rollout | null }>()
 
 const cfg = reactive({
   client_id: 'client-A',
@@ -12,10 +12,18 @@ const cfg = reactive({
   count: 60,
   batch: 10,
   interval_ms: 100,
+  // >0 spreads the load across N deterministic subjects so a gray rollout's
+  // proportional split is directly visible (stable across repeated replays).
+  distinct_clients: 0,
 })
 
 const running = ref(false)
-const result = ref<{ allowed: number; denied: number; items: Array<{ seq: number; allowed: boolean; level?: string }> } | null>(null)
+const result = ref<{
+  allowed: number
+  denied: number
+  by_version?: Record<string, { allowed: number; denied: number }>
+  items: Array<{ seq: number; allowed: boolean; level?: string; version?: string }>
+} | null>(null)
 const lastVerdict = ref<Verdict | null>(null)
 const error = ref('')
 
@@ -63,8 +71,9 @@ async function run() {
       client_id: cfg.client_id,
       api_path: cfg.api_path,
       group: cfg.group,
+      distinct_clients: cfg.distinct_clients,
     })
-    result.value = { allowed: r.allowed, denied: r.denied, items: r.items }
+    result.value = { allowed: r.allowed, denied: r.denied, items: r.items, by_version: r.by_version }
   } catch (e: any) {
     error.value = e.message
   } finally {
@@ -123,6 +132,13 @@ const sequence = computed(() => result.value?.items ?? [])
       </label>
     </div>
 
+    <label v-if="rollout" class="field" style="margin-top:10px">
+      <span class="lbl">
+        灰度回放：分散到 N 个判定主体（0 = 只用上面的单个 client；建议 100 以观察 {{ rollout.percent }}% 分流）
+      </span>
+      <input v-model.number="cfg.distinct_clients" type="number" min="0" max="2000" />
+    </label>
+
     <div class="row" style="margin: 6px 0 12px">
       <button v-for="p in PRESETS" :key="p.name" class="secondary small" @click="p.apply()">
         {{ p.name }}
@@ -144,14 +160,34 @@ const sequence = computed(() => result.value?.items ?? [])
           <div class="k">放行率</div>
         </div>
       </div>
-      <div class="muted" style="margin-top:8px">判定序列（绿=放行，红=拒绝，按请求顺序）：</div>
+
+      <div v-if="result.by_version && rollout" class="grid-2" style="margin-top:8px">
+        <div class="stat">
+          <div class="v">
+            <span class="green">{{ result.by_version.stable?.allowed ?? 0 }}</span>
+            /<span class="red">{{ result.by_version.stable?.denied ?? 0 }}</span>
+          </div>
+          <div class="k">旧版本 stable（放行/拒绝）</div>
+        </div>
+        <div class="stat">
+          <div class="v amber">
+            <span style="color:#f5a623">{{ result.by_version.canary?.allowed ?? 0 }}</span>
+            /<span class="red">{{ result.by_version.canary?.denied ?? 0 }}</span>
+          </div>
+          <div class="k">新版本 canary（放行/拒绝）</div>
+        </div>
+      </div>
+
+      <div class="muted" style="margin-top:8px">
+        判定序列（绿=旧版放行，橙=新版放行，红=拒绝，按请求顺序；反复回放同一批主体分流不变）：
+      </div>
       <div class="seq">
         <div
           v-for="it in sequence"
           :key="it.seq"
           class="cell"
-          :class="it.allowed ? 'a' : 'd'"
-          :title="`#${it.seq + 1} ${it.allowed ? '放行' : '拒绝 ' + (it.level ?? '')}`"
+          :class="it.allowed ? (it.version === 'canary' ? 'c' : 'a') : 'd'"
+          :title="`#${it.seq + 1} ${it.version === 'canary' ? '新版本' : '旧版本'} ${it.allowed ? '放行' : '拒绝 ' + (it.level ?? '')}`"
         />
       </div>
     </div>
@@ -159,6 +195,13 @@ const sequence = computed(() => result.value?.items ?? [])
     <div v-if="lastVerdict" class="verdict-box" :class="lastVerdict.allowed ? 'ok' : 'no'">
       <template v-if="lastVerdict.allowed">
         <strong style="color:var(--green)">放行 200</strong>
+        <span
+          v-if="lastVerdict.version"
+          class="badge"
+          :style="lastVerdict.version === 'canary' ? 'background:#f5a623;color:#1a1a1a;margin-left:6px' : 'margin-left:6px'"
+        >
+          {{ lastVerdict.version === 'canary' ? '新版本 canary' : '旧版本 stable' }}
+        </span>
         <div v-for="rr in lastVerdict.results" :key="rr.rule_id" style="margin-top:4px">
           规则「{{ rr.rule_name }}」各级余量：
           <span v-for="lv in rr.levels" :key="lv.key" class="mono" style="margin-right:8px">
@@ -168,6 +211,13 @@ const sequence = computed(() => result.value?.items ?? [])
       </template>
       <template v-else>
         <strong style="color:var(--red)">拒绝 429</strong>
+        <span
+          v-if="lastVerdict.version"
+          class="badge"
+          :style="lastVerdict.version === 'canary' ? 'background:#f5a623;color:#1a1a1a;margin-left:6px' : 'margin-left:6px'"
+        >
+          {{ lastVerdict.version === 'canary' ? '新版本 canary' : '旧版本 stable' }}
+        </span>
         <div style="margin-top:4px">
           被规则「{{ lastVerdict.rule_name }}」的
           <strong>{{ lastVerdict.level }}</strong> 级配额挡下
@@ -177,3 +227,9 @@ const sequence = computed(() => result.value?.items ?? [])
     </div>
   </div>
 </template>
+
+<style scoped>
+.seq .cell.c {
+  background: #f5a623;
+}
+</style>
