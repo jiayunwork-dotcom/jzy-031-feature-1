@@ -2,11 +2,17 @@
 // Redis keys that keep each AND-combination of dimension values separately
 // counted. Different dimension values always get different keys, so client A
 // exhausting its quota can never consume client B's.
+//
+// During a gray rollout the old and new rule versions each own a completely
+// separate counter namespace: Key takes the version and inserts a `canary`
+// segment for the new version. Both variants keep the rule id hash tag, so
+// the promotion migration can RENAME keys cluster-safely.
 package matcher
 
 import (
 	"strings"
 
+	"ratelimit-gateway/internal/canary"
 	"ratelimit-gateway/internal/model"
 )
 
@@ -52,19 +58,25 @@ func contains(xs []string, v string) bool {
 	return false
 }
 
-// Key builds the Redis key for one (rule, level, request) bucket.
+// Key builds the Redis key for one (rule, version, level, request) bucket.
 //
 // The key contains exactly the dimension values that define the level:
 // global is shared by everyone; group groups by `group`; api by `api_path`;
 // client by the full AND-combination the rule declares plus the client, so a
 // client's quota is tracked per rule/interface independently.
 //
-// Format: rl:{ruleID}:{level}:<ordered dim=value pairs>
-func (m *Matcher) Key(rule *model.Rule, level model.Level, rctx model.RequestContext) string {
+// Format:
+//
+//	old:  rl:{ruleID}:{level}:<dim pairs>
+//	new:  rl:{ruleID}:canary:{level}:<dim pairs>
+func (m *Matcher) Key(rule *model.Rule, version canary.Version, level model.Level, rctx model.RequestContext) string {
 	var b strings.Builder
 	b.WriteString("rl:{")
 	b.WriteString(rule.ID)
 	b.WriteString("}:")
+	if version == canary.VersionNew {
+		b.WriteString("canary:")
+	}
 	b.WriteString(string(level))
 	b.WriteString(":")
 

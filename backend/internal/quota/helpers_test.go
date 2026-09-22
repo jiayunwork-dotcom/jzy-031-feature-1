@@ -1,6 +1,7 @@
 package quota_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/redis/go-redis/v9"
@@ -11,6 +12,12 @@ import (
 	"ratelimit-gateway/internal/store"
 	"ratelimit-gateway/internal/testboot"
 )
+
+func newMgr(ctx context.Context, rdb *redis.Client) (*engine.Manager, error) {
+	return engine.NewManager(ctx, rdb)
+}
+
+func newRec(rdb *redis.Client) *stats.Recorder { return stats.New(rdb) }
 
 type stack struct {
 	rdb   *redis.Client

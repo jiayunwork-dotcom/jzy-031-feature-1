@@ -30,6 +30,9 @@ type DenyEvent struct {
 	APIPath   string `json:"api_path"`
 	Group     string `json:"group"`
 	Remaining int64  `json:"remaining"`
+	// Version is "old" or "new" while the rule is gray-released and empty
+	// for an ordinary single-version rule.
+	Version string `json:"version,omitempty"`
 }
 
 // Point holds the outcomes recorded in one second bucket.
@@ -45,26 +48,36 @@ type Recorder struct {
 
 func New(rdb *redis.Client) *Recorder { return &Recorder{rdb: rdb} }
 
-func tsKey(ruleID string, outcome string) string {
-	return fmt.Sprintf("stat:{%s}:%s", ruleID, outcome)
-}
-func denyKey(ruleID string) string { return fmt.Sprintf("deny:{%s}", ruleID) }
-
-func outcomeKey(ruleID string, allowed bool) string {
-	if allowed {
-		return tsKey(ruleID, "allow")
+func tsKey(ruleID, version, outcome string) string {
+	if version == "" {
+		return fmt.Sprintf("stat:{%s}:%s", ruleID, outcome)
 	}
-	return tsKey(ruleID, "deny")
+	return fmt.Sprintf("stat:{%s}:%s:%s", ruleID, version, outcome)
+}
+func denyKey(ruleID, version string) string {
+	if version == "" {
+		return fmt.Sprintf("deny:{%s}", ruleID)
+	}
+	return fmt.Sprintf("deny:{%s}:%s", ruleID, version)
 }
 
-// Tick records one evaluated request for a rule. The timestamp is supplied by
-// the caller: for the leaky bucket it is the request's paced release time so
-// the allow curve reflects shaped output rather than arrival. Call in a
-// pipeline to avoid extra round trips.
-func Tick(pipe redis.Pipeliner, ruleID string, allowed bool, at time.Time) {
+func outcomeKey(ruleID, version string, allowed bool) string {
+	if allowed {
+		return tsKey(ruleID, version, "allow")
+	}
+	return tsKey(ruleID, version, "deny")
+}
+
+// Tick records one evaluated request for a rule version. The timestamp is
+// supplied by the caller: for the leaky bucket it is the request's paced
+// release time so the allow curve reflects shaped output rather than arrival.
+// Call in a pipeline to avoid extra round trips. version is empty for an
+// ordinary rule and "old"/"new" during a gray rollout, so the two versions'
+// curves never borrow from each other.
+func Tick(pipe redis.Pipeliner, ruleID, version string, allowed bool, at time.Time) {
 	sec := strconv.FormatInt(at.Unix(), 10)
-	k1 := outcomeKey(ruleID, allowed)
-	k2 := outcomeKey("_all", allowed)
+	k1 := outcomeKey(ruleID, version, allowed)
+	k2 := outcomeKey("_all", "", allowed)
 	pipe.ZIncrBy(context.Background(), k1, 1, sec)
 	pipe.ZIncrBy(context.Background(), k2, 1, sec)
 	// Refresh retention so idle series keys are eventually reclaimed.
@@ -74,18 +87,22 @@ func Tick(pipe redis.Pipeliner, ruleID string, allowed bool, at time.Time) {
 
 // ExpireTS sets retention on the time-series keys (best effort).
 func (r *Recorder) ExpireTS(ctx context.Context, ruleID string) {
-	for _, k := range []string{tsKey(ruleID, "allow"), tsKey(ruleID, "deny")} {
+	for _, k := range []string{
+		tsKey(ruleID, "", "allow"), tsKey(ruleID, "", "deny"),
+		tsKey(ruleID, "old", "allow"), tsKey(ruleID, "old", "deny"),
+		tsKey(ruleID, "new", "allow"), tsKey(ruleID, "new", "deny"),
+	} {
 		_ = r.rdb.Expire(ctx, k, tsTTL).Err()
 	}
 }
 
-// PushDeny appends a rejection to the rule's capped log.
+// PushDeny appends a rejection to the rule version's capped log.
 func (r *Recorder) PushDeny(ctx context.Context, e DenyEvent) error {
 	raw, err := json.Marshal(e)
 	if err != nil {
 		return err
 	}
-	k := denyKey(e.RuleID)
+	k := denyKey(e.RuleID, e.Version)
 	pipe := r.rdb.TxPipeline()
 	pipe.LPush(ctx, k, raw)
 	pipe.LTrim(ctx, k, 0, denyLogLen-1)
@@ -95,19 +112,20 @@ func (r *Recorder) PushDeny(ctx context.Context, e DenyEvent) error {
 }
 
 // TimeSeries returns the last `seconds` seconds of allow/deny counts,
-// zero-filling seconds with no events.
-func (r *Recorder) TimeSeries(ctx context.Context, ruleID string, seconds int64) ([]Point, error) {
+// zero-filling seconds with no events. version "" is the plain (and
+// pre-rollout aggregate) series; "old"/"new" select a rollout side.
+func (r *Recorder) TimeSeries(ctx context.Context, ruleID, version string, seconds int64) ([]Point, error) {
 	if ruleID == "" {
 		ruleID = "_all"
 	}
 	now := time.Now().Unix()
 	cutoff := now - seconds + 1
 
-	allow, err := r.rangeCounts(ctx, tsKey(ruleID, "allow"), cutoff)
+	allow, err := r.rangeCounts(ctx, tsKey(ruleID, version, "allow"), cutoff)
 	if err != nil {
 		return nil, err
 	}
-	deny, err := r.rangeCounts(ctx, tsKey(ruleID, "deny"), cutoff)
+	deny, err := r.rangeCounts(ctx, tsKey(ruleID, version, "deny"), cutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -139,12 +157,14 @@ func (r *Recorder) rangeCounts(ctx context.Context, key string, cutoff int64) (m
 }
 
 // RecentDenies returns the newest rejection events for a rule (or all rules).
-func (r *Recorder) RecentDenies(ctx context.Context, ruleID string, limit int64) ([]DenyEvent, error) {
+// version "" reads the plain/default log for the rule; "old"/"new" read a
+// rollout side's separate log.
+func (r *Recorder) RecentDenies(ctx context.Context, ruleID, version string, limit int64) ([]DenyEvent, error) {
 	if limit <= 0 || limit > denyLogLen {
 		limit = denyLogLen
 	}
 	if ruleID != "" {
-		return r.popDenies(ctx, denyKey(ruleID), limit)
+		return r.popDenies(ctx, denyKey(ruleID, version), limit)
 	}
 	var keys []string
 	var cursor uint64

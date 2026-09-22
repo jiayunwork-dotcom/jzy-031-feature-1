@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 
+	"ratelimit-gateway/internal/canary"
 	"ratelimit-gateway/internal/model"
 )
 
@@ -22,16 +23,18 @@ type redisStateReader interface {
 
 // activeKey describes one live bucket/window for the dashboard.
 type activeKey struct {
-	Level     string `json:"level"`
-	Key       string `json:"key"`
-	Remaining int64  `json:"remaining"`
-	ResetInMs int64  `json:"reset_in_ms"`
-	Kind      string `json:"kind"`
+	Level   string `json:"level"`
+	Version string `json:"version"`
+	Key     string `json:"key"`
+	Remaining int64 `json:"remaining"`
+	ResetInMs int64 `json:"reset_in_ms"`
+	Kind    string `json:"kind"`
 }
 
 // ruleState scans Redis for a rule's active buckets and peeks each one.
 // Query params client_id / api_path / group let the dashboard pick which
-// concrete dimension combination to read.
+// concrete dimension combination to read. During a gray rollout both
+// versions' levels and active keys are returned separately.
 func (s *Server) ruleState(c *gin.Context) {
 	id := c.Param("id")
 	rule, ok := s.rules.Get(id)
@@ -45,21 +48,26 @@ func (s *Server) ruleState(c *gin.Context) {
 		Group:    c.Query("group"),
 	}
 
-	// Peek the four canonical keys for the requested dimension combination.
-	levels := s.checker.PeekRule(c.Request.Context(), rule, rctx)
+	resp := gin.H{
+		"rule": s.toDTO(rule),
+		"selected": gin.H{
+			"old": s.checker.PeekRule(c.Request.Context(), rule, "", rctx),
+		},
+	}
+	if _, has := s.rules.Rollout(id); has {
+		resp["selected"].(gin.H)["new"] = s.checker.PeekRule(c.Request.Context(), rule, canary.VersionNew, rctx)
+	}
 
-	// Plus enumerate all active physical keys of this rule from Redis.
+	// Plus enumerate all active physical keys of this rule from Redis,
+	// including the canary namespace.
 	live, err := s.scanActive(c.Request.Context(), id, rule)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	resp["active_keys"] = live
 
-	c.JSON(http.StatusOK, gin.H{
-		"rule":        rule,
-		"selected":    levels,
-		"active_keys": live,
-	})
+	c.JSON(http.StatusOK, resp)
 }
 
 func (s *Server) scanActive(ctx context.Context, ruleID string, rule *model.Rule) ([]activeKey, error) {
@@ -84,22 +92,34 @@ func (s *Server) scanActive(ctx context.Context, ruleID string, rule *model.Rule
 	out := make([]activeKey, 0, len(keys))
 	for _, k := range keys {
 		ak := activeKey{Key: k, Kind: string(rule.Algorithm)}
-		parts := strings.SplitN(k, ":", 3)
-		if len(parts) == 3 {
-			segs := strings.SplitN(parts[2], ":", 2)
-			ak.Level = segs[0]
+		// key forms:
+		//   rl:{id}:<level>:...          -> old/canonical
+		//   rl:{id}:canary:<level>:...   -> new
+		rest := strings.TrimPrefix(k, "rl:{"+ruleID+"}:")
+		if strings.HasPrefix(rest, "canary:") {
+			ak.Version = "new"
+			rest = strings.TrimPrefix(rest, "canary:")
+		} else {
+			ak.Version = "old"
 		}
-		switch rule.Algorithm {
+		if i := strings.IndexByte(rest, ':'); i >= 0 {
+			ak.Level = rest[:i]
+		}
+		cfgRule := rule
+		if rl, has := s.rules.Rollout(ruleID); has && ak.Version == "new" {
+			cfgRule = &rl.NewRule
+		}
+		switch cfgRule.Algorithm {
 		case model.AlgoSlidingLog:
 			n, err := s.redis.ZCard(ctx, k).Result()
 			if err == nil {
-				cfg := rule.Levels[model.Level(ak.Level)]
+				cfg := cfgRule.Levels[model.Level(ak.Level)]
 				ak.Remaining = cfg.Threshold - n
 			}
 		default:
 			m, err := s.redis.HGetAll(ctx, k).Result()
 			if err == nil {
-				ak.Remaining = interpretRemaining(rule, ak.Level, m)
+				ak.Remaining = interpretRemaining(cfgRule, ak.Level, m)
 			}
 		}
 		out = append(out, ak)

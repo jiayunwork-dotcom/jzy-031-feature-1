@@ -61,7 +61,7 @@ func truncateRules(t *testing.T) {
 DO $$
 BEGIN
   IF EXISTS (SELECT FROM pg_tables WHERE schemaname='public' AND tablename='rules') THEN
-    EXECUTE 'TRUNCATE rules';
+    EXECUTE 'TRUNCATE rules CASCADE';
   END IF;
 END $$;`)
 	if err != nil {

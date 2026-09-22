@@ -59,6 +59,12 @@ func (s *Server) Router() *gin.Engine {
 		api.PUT("/rules/:id", s.updateRule)
 		api.DELETE("/rules/:id", s.deleteRule)
 
+		// gray rollout control: resize (incl. 100=promote / 0=abort), abort,
+		// and deterministic "which side is this subject on" preview
+		api.POST("/rules/:id/rollout", s.setRollout)
+		api.DELETE("/rules/:id/rollout", s.abortRollout)
+		api.POST("/rules/:id/rollout/preview", s.rolloutPreview)
+
 		// the real gateway ingress: a decision per request
 		api.POST("/gateway/check", s.gatewayCheck)
 
@@ -112,6 +118,7 @@ func (s *Server) gatewayCheck(c *gin.Context) {
 		"allowed":   false,
 		"rule_id":   v.RuleID,
 		"rule_name": v.RuleName,
+		"version":   string(v.Version),
 		"level":     string(v.Level),
 		"reason":    v.Reason,
 		"results":   v.Results,
